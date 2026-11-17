@@ -25,14 +25,17 @@ near-zero hour-1 print and a meaningless ratio, so it is left out):
 
     ln(v_h / v_1) = a_h + b_h * ln(v_1) + noise
 
-fitted by least squares. The median forecast is p1 * exp(a_h + b_h * x),
-where p1 is this case's hour-1 print and x is ln(p1), capped at the
-training pool's largest ln(v_1) plus 0.3 so an unprecedented print (GTA VI
-may well be one) cannot drag the forecast far past anything ever seen. The
-spread is the residual standard deviation, widened by the regression
-leverage  sqrt(1 + 1/n + (x - xbar)^2 / Sxx)  so a print far from the
-pool's centre honestly gets a wider band, and the five quantiles are
-p1 * exp(median + z_tau * spread) with z the standard normal quantiles.
+fitted by a Huber-robust regression (a few reweighted rounds, so one
+launch with a wildly different shape cannot drag the line for everyone
+else). The median forecast is p1 * exp(a_h + b_h * x), where p1 is this
+case's hour-1 print and x is ln(p1), capped at the training pool's largest
+ln(v_1) plus 0.3 so an unprecedented print (GTA VI may well be one) cannot
+drag the forecast far past anything ever seen. The five quantiles come
+from the fit's own residuals, not from a normal curve: the residuals have
+a tight core and a long upper tail (launches that ramp late), so the
+empirical residual quantiles, centred on their median and widened by the
+regression leverage  sqrt(1 + 1/n + (x - xbar)^2 / Sxx), put the 75th
+percentile where the data puts it instead of where a bell curve would.
 
 If too few comparables carry an hour, the program falls back to that
 hour's empirical quantiles of the log-ratios, and if there is no usable
@@ -41,11 +44,14 @@ hour 1's print, spread widening like a random walk). Every fallback keeps
 the output valid: 23 rows, hours 2..24, five finite numbers > 0 and at
 most 1e9, non-decreasing, at most 65,536 bytes.
 
-Local validation (leave-one-out over the case's 16 rolling-midnight
-launches, and the 4 practice cases against SullyGnome's own figures):
-the regression scores about 0.22 mean pinball loss where the persistence
-baseline scores about 0.36-0.39, and 0.16 on the practice set against the
-baseline's 0.39.
+Local validation (leave-one-out over the 16 rolling-midnight launches the
+final case pools, and the 4 practice cases against SullyGnome's own
+figures): the regression scores about 0.11 mean pinball loss on the log
+scale where the persistence baseline scores about 0.18, and 0.080 on the
+practice set against the baseline's 0.19. One launch (Resident Evil
+Requiem) ramps far harder than its hour-1 print predicts and stays the
+worst case under every variant tried; no second feature tested (pre-launch
+baseline, hour-1 channels per viewer) predicted that shape.
 
 How the grader runs it: `python3 -P -s /bot/main.py` in python:3.13-slim.
 Outside the grader, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in
@@ -64,7 +70,7 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 # The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
+# The standard normal's quantile at each level (persistence fallback only).
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
 # Persistence baseline's spread, in log units per square-root hour (the
 # house baseline's fixed sigma; used only as a fallback).
@@ -146,6 +152,39 @@ def ols(xs, ys):
     return ybar - b * xbar, b, xbar, sxx
 
 
+def _wols(xs, ys, ws):
+    """Weighted least squares y = a + b*x; returns (a, b)."""
+    sw = sum(ws)
+    xbar = sum(w * x for w, x in zip(ws, xs)) / sw
+    ybar = sum(w * y for w, y in zip(ws, ys)) / sw
+    sxx = sum(w * (x - xbar) ** 2 for w, x in zip(ws, xs))
+    if sxx <= 0:
+        return ybar, 0.0
+    b = sum(w * (x - xbar) * (y - ybar) for w, x, y in zip(ws, xs, ys)) / sxx
+    return ybar - b * xbar, b
+
+
+def huber_fit(xs, ys, rounds=3, k=1.345):
+    """Huber IRLS fit y = a + b*x; returns (a, b, xbar, sxx) like ols.
+
+    A few reweighted rounds: each round's residuals set a robust scale
+    (1.4826 * MAD), and points further than k scales out get downweighted
+    instead of dropped. One launch with an extreme shape -- a late ramp
+    twice the pool's -- then bends the line far less, while staying in
+    the pool for the spread.
+    """
+    a, b, xbar, sxx = ols(xs, ys)
+    for _ in range(rounds):
+        res = [y - (a + b * x) for x, y in zip(xs, ys)]
+        mad = sorted(abs(r) for r in res)[len(res) // 2]
+        scale = 1.4826 * mad
+        if scale <= 0:
+            break
+        ws = [1.0 if abs(r) <= k * scale else k * scale / abs(r) for r in res]
+        a, b = _wols(xs, ys, ws)
+    return a, b, xbar, sxx
+
+
 def _quantile(sorted_values, tau):
     n = len(sorted_values)
     if n == 0:
@@ -176,20 +215,23 @@ def hour_forecast(p1, hour, pool):
             xs.append(math.log(series[1]))
             ys.append(math.log(series[hour] / series[1]))
     if len(xs) >= MIN_REGRESSION_POINTS:
-        a, b, xbar, sxx = ols(xs, ys)
+        a, b, xbar, sxx = huber_fit(xs, ys)
         x = math.log(p1)
         xmax = max(xs) + CAP_EXTRA
         if x > xmax:
             x = xmax
         median_log = a + b * x
-        residuals = [y - (a + b * xx) for xx, y in zip(xs, ys)]
-        spread = _stddev(residuals)
+        residuals = sorted(y - (a + b * xx) for xx, y in zip(xs, ys))
+        # The quantiles are the fit's own residuals, not a bell curve:
+        # centred on the residual median (so the 50th stays on the fitted
+        # line) and widened by the regression leverage, so a print far
+        # from the pool's centre honestly gets a wider band.
+        med_res = _quantile(residuals, 0.5)
+        lev = 1.0
         if sxx > 0:
-            leverage = 1.0 + 1.0 / len(xs) + (x - xbar) ** 2 / sxx
-            spread *= math.sqrt(leverage)
-        if spread <= 0:
-            spread = BASE_SIGMA * math.sqrt(hour - 1)
-        return [p1 * math.exp(median_log + z * spread) for z in Z]
+            lev = math.sqrt(1.0 + 1.0 / len(xs) + (x - xbar) ** 2 / sxx)
+        return [p1 * math.exp(median_log + (_quantile(residuals, tau) - med_res) * lev)
+                for tau in LEVELS]
     if xs:
         ratios = sorted(ys)
         return [p1 * math.exp(_quantile(ratios, tau)) for tau in LEVELS]
